@@ -144,6 +144,7 @@ target/
 *.json
 tmp/
 *.lock
+!Cargo.lock
 evaluation_datasets/
 
 # BEIR Datasets

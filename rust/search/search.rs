@@ -622,12 +622,6 @@ pub fn search(
             return Ok((vec![], vec![], None));
         }
 
-        // Full decompression and exact scoring
-        let (final_codes, final_doc_lengths) =
-            doc_codes_strided.lookup(&passage_ids_to_rerank, device);
-
-        let (final_residuals, _) = doc_residuals_strided.lookup(&passage_ids_to_rerank, device);
-
         let bucket_weights = codec
             .bucket_weights
             .as_ref()
@@ -637,23 +631,61 @@ pub fn search(
                 anyhow!("Codec missing bucket_weight_indices_lookup for decompression.")
             })?;
 
-        let decompressed_embeddings = decompress_residuals(
-            &final_residuals,
-            bucket_weights,
-            &codec.byte_reversed_bits_map,
-            bucket_weight_indices_lookup,
-            &final_codes,
-            &codec.centroids,
-            embedding_dimension,
-            nbits_param,
-        );
+        // Full decompression and exact scoring. This is the highest-memory step:
+        // it forms [docs_to_rerank, max_doc_tokens, query_tokens]. Long-context
+        // queries can exceed VRAM even when query batch_size is 1, so allow this
+        // exact scoring stage to run in implementation chunks. The candidate
+        // set, n_full_scores, n_ivf_probe, and top_k semantics are unchanged.
+        let total_passage_ids_for_exact = passage_ids_to_rerank.size()[0];
+        let exact_batch_size = std::env::var("FAST_PLAID_FULL_SCORE_BATCH_SIZE")
+            .ok()
+            .and_then(|value| value.parse::<i64>().ok())
+            .filter(|value| *value > 0)
+            .unwrap_or(total_passage_ids_for_exact)
+            .min(total_passage_ids_for_exact)
+            .max(1);
+        let num_exact_batches =
+            (total_passage_ids_for_exact + exact_batch_size - 1) / exact_batch_size;
+        let mut exact_score_chunks = Vec::new();
 
-        let (padded_doc_embeddings, mask) =
-            direct_pad_sequences(&decompressed_embeddings, &final_doc_lengths, 0.0, device)?;
+        for step in 0..num_exact_batches {
+            let batch_start = step * exact_batch_size;
+            let batch_end = ((step + 1) * exact_batch_size).min(total_passage_ids_for_exact);
+            if batch_start >= batch_end {
+                continue;
+            }
 
-        let token_scores_3d =
-            padded_doc_embeddings.matmul(&query_embeddings_unsqueezed.transpose(-2, -1));
-        let reduced_scores = colbert_score_reduce(&token_scores_3d, &mask);
+            let batch_passage_ids =
+                passage_ids_to_rerank.narrow(0, batch_start, batch_end - batch_start);
+            let (batch_codes, batch_doc_lengths) =
+                doc_codes_strided.lookup(&batch_passage_ids, device);
+            let (batch_residuals, _) = doc_residuals_strided.lookup(&batch_passage_ids, device);
+
+            let decompressed_embeddings = decompress_residuals(
+                &batch_residuals,
+                bucket_weights,
+                &codec.byte_reversed_bits_map,
+                bucket_weight_indices_lookup,
+                &batch_codes,
+                &codec.centroids,
+                embedding_dimension,
+                nbits_param,
+            );
+
+            let (padded_doc_embeddings, mask) =
+                direct_pad_sequences(&decompressed_embeddings, &batch_doc_lengths, 0.0, device)?;
+
+            let token_scores_3d =
+                padded_doc_embeddings.matmul(&query_embeddings_unsqueezed.transpose(-2, -1));
+            let reduced_scores = colbert_score_reduce(&token_scores_3d, &mask);
+            exact_score_chunks.push(reduced_scores);
+        }
+
+        let reduced_scores = if !exact_score_chunks.is_empty() {
+            Tensor::cat(&exact_score_chunks, 0)
+        } else {
+            Tensor::empty(&[0], (Kind::Float, device))
+        };
 
         // Final top-k sort
         let (reduced_scores, sorted_indices) = reduced_scores.sort(0, true);
@@ -664,11 +696,34 @@ pub fn search(
         let reduced_scores: Vec<f32> = reduced_scores.try_into()?;
 
         let result_count = top_k.min(sorted_passage_ids.len());
+        let result_passage_ids = sorted_passage_ids[..result_count].to_vec();
+        let result_scores = reduced_scores[..result_count].to_vec();
 
         let token_matrices = if return_token_scores {
-            let sorted_token_scores = token_scores_3d.index_select(0, &sorted_indices);
-            let sorted_doc_lengths: Vec<i64> =
-                final_doc_lengths.index_select(0, &sorted_indices).try_into()?;
+            let result_passage_ids_tensor = Tensor::from_slice(&result_passage_ids)
+                .to_device(device)
+                .to_kind(Kind::Int64);
+            let (result_codes, result_doc_lengths) =
+                doc_codes_strided.lookup(&result_passage_ids_tensor, device);
+            let (result_residuals, _) =
+                doc_residuals_strided.lookup(&result_passage_ids_tensor, device);
+
+            let result_embeddings = decompress_residuals(
+                &result_residuals,
+                bucket_weights,
+                &codec.byte_reversed_bits_map,
+                bucket_weight_indices_lookup,
+                &result_codes,
+                &codec.centroids,
+                embedding_dimension,
+                nbits_param,
+            );
+
+            let (padded_doc_embeddings, _) =
+                direct_pad_sequences(&result_embeddings, &result_doc_lengths, 0.0, device)?;
+            let sorted_token_scores =
+                padded_doc_embeddings.matmul(&query_embeddings_unsqueezed.transpose(-2, -1));
+            let sorted_doc_lengths: Vec<i64> = result_doc_lengths.try_into()?;
 
             let mut matrices = Vec::with_capacity(result_count);
             for i in 0..result_count {
@@ -685,11 +740,7 @@ pub fn search(
             None
         };
 
-        Ok((
-            sorted_passage_ids[..result_count].to_vec(),
-            reduced_scores[..result_count].to_vec(),
-            token_matrices,
-        ))
+        Ok((result_passage_ids, result_scores, token_matrices))
     })?;
 
     Ok((passage_ids, scores, token_matrices))
