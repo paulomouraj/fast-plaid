@@ -2,7 +2,8 @@ use anyhow::{anyhow, bail, Result};
 use indicatif::{ProgressBar, ProgressIterator};
 use pyo3::prelude::*;
 use serde::Serialize;
-use tch::{Device, IndexOp, Kind, Tensor};
+use std::time::{Duration, Instant};
+use tch::{Cuda, Device, IndexOp, Kind, Tensor};
 
 use pyo3_tch::PyTensor;
 
@@ -10,6 +11,64 @@ use crate::search::load::LoadedIndex;
 use crate::search::padding::direct_pad_sequences;
 use crate::search::tensor::StridedTensor;
 use crate::utils::residual_codec::ResidualCodec;
+
+fn synchronize_if_profiling(device: Device, profile: bool) {
+    if !profile {
+        return;
+    }
+
+    if let Device::Cuda(device_index) = device {
+        Cuda::synchronize(device_index as i64);
+    }
+}
+
+fn trim_trailing_zero_query_tokens(query_embeddings: &Tensor) -> Tensor {
+    let query_shape = query_embeddings.size();
+    if query_shape.len() != 2 || query_shape[0] <= 1 {
+        return query_embeddings.shallow_clone();
+    }
+
+    let row_has_value = query_embeddings
+        .abs()
+        .sum_dim_intlist(-1, false, Kind::Float)
+        .gt(0.0);
+    let nonzero_rows = row_has_value.nonzero();
+    if nonzero_rows.numel() == 0 {
+        return query_embeddings.shallow_clone();
+    }
+
+    let last_nonzero_row = nonzero_rows.select(1, 0).max().int64_value(&[]) + 1;
+    if last_nonzero_row < query_shape[0] {
+        query_embeddings.narrow(0, 0, last_nonzero_row)
+    } else {
+        query_embeddings.shallow_clone()
+    }
+}
+
+fn sort_passage_ids_by_doc_length_with_restore(
+    passage_ids: &Tensor,
+    doc_codes_strided: &StridedTensor,
+    device: Device,
+) -> (Tensor, Tensor) {
+    if passage_ids.numel() <= 1 {
+        return (
+            passage_ids.shallow_clone(),
+            Tensor::arange(passage_ids.numel() as i64, (Kind::Int64, device)),
+        );
+    }
+
+    let lengths_device = doc_codes_strided.element_lengths.device();
+    let ids_for_lengths = passage_ids.to_device(lengths_device).to_kind(Kind::Int64);
+    let passage_lengths = doc_codes_strided
+        .element_lengths
+        .index_select(0, &ids_for_lengths);
+    let (_, length_order) = passage_lengths.sort(0, false);
+    let length_order = length_order.to_device(device);
+    let sorted_passage_ids = passage_ids.index_select(0, &length_order);
+    let (_, restore_order) = length_order.sort(0, false);
+
+    (sorted_passage_ids, restore_order)
+}
 
 /// Decompresses residual vectors from a packed, quantized format.
 ///
@@ -383,13 +442,9 @@ pub fn search_many_with_token_scores(
 /// A 1D `Tensor` of shape `[batch_size]`, where each element is the final aggregated
 /// ColBERT score for a query-document pair.
 pub fn colbert_score_reduce(token_scores: &Tensor, attention_mask: &Tensor) -> Tensor {
-    let scores_shape = token_scores.size();
-
-    // Expand the document attention mask to match the shape of the token scores.
-    let expanded_mask = attention_mask.unsqueeze(-1).expand(&scores_shape, true);
-
-    // Invert the mask to identify padding positions.
-    let padding_mask = expanded_mask.logical_not();
+    // Broadcast the document padding mask across query tokens without
+    // materializing a full [batch, doc_len, query_len] boolean tensor.
+    let padding_mask = attention_mask.logical_not().unsqueeze(-1);
 
     // Nullify scores at padded positions by filling them with a large negative number.
     let masked_scores = token_scores.masked_fill(&padding_mask, -9999.0);
@@ -485,6 +540,17 @@ pub fn search(
     return_token_scores: bool,
 ) -> anyhow::Result<(Vec<i64>, Vec<f32>, Option<Vec<Tensor>>)> {
     let (passage_ids, scores, token_matrices) = tch::no_grad(|| {
+        let profile = std::env::var("FAST_PLAID_PROFILE").is_ok();
+        let profile_total_start = Instant::now();
+        let mut profile_stage_start = Instant::now();
+        let original_q_tokens = query_embeddings.size()[0];
+        let query_embeddings = if std::env::var("FAST_PLAID_DISABLE_QUERY_TRIM").is_ok() {
+            query_embeddings.shallow_clone()
+        } else {
+            trim_trailing_zero_query_tokens(query_embeddings)
+        };
+        let q_tokens = query_embeddings.size()[0];
+
         let query_embeddings_unsqueezed = query_embeddings.unsqueeze(0);
 
         // Compute query-centroid scores
@@ -530,6 +596,9 @@ pub fn search(
 
         let (unique_ivf_cells_to_probe, _, _) =
             flat_cells_to_probe.unique_dim(-1, true, false, false);
+        synchronize_if_profiling(device, profile);
+        let centroid_ms = profile_stage_start.elapsed().as_secs_f64() * 1000.0;
+        profile_stage_start = Instant::now();
 
         // Retrieve candidate documents via IVF lookup
         let (retrieved_passage_ids_ivf, _) =
@@ -545,15 +614,33 @@ pub fn search(
             unique_passage_ids =
                 filter_passage_ids_with_subset(&unique_passage_ids, subset_tensor, device);
         }
+        synchronize_if_profiling(device, profile);
+        let ivf_ms = profile_stage_start.elapsed().as_secs_f64() * 1000.0;
+        profile_stage_start = Instant::now();
+        let candidate_count = unique_passage_ids.size()[0];
 
         if unique_passage_ids.numel() == 0 {
             return Ok((vec![], vec![], None));
         }
 
+        let sort_doc_batches_by_length =
+            std::env::var("FAST_PLAID_DISABLE_DOC_LENGTH_SORT").is_err();
+        let (passage_ids_for_approx, approx_restore_order) = if sort_doc_batches_by_length {
+            let (sorted_passage_ids, restore_order) = sort_passage_ids_by_doc_length_with_restore(
+                &unique_passage_ids,
+                doc_codes_strided,
+                device,
+            );
+            (sorted_passage_ids, Some(restore_order))
+        } else {
+            (unique_passage_ids.shallow_clone(), None)
+        };
+
         // Approximate scoring using coarse centroids
         let mut approx_score_chunks = Vec::new();
-        let total_passage_ids_for_approx = unique_passage_ids.size()[0];
+        let total_passage_ids_for_approx = passage_ids_for_approx.size()[0];
         let num_approx_batches = (total_passage_ids_for_approx + batch_size - 1) / batch_size;
+        let mut approx_padded_elements: i128 = 0;
 
         for step in 0..num_approx_batches {
             let batch_start = step * batch_size;
@@ -563,9 +650,15 @@ pub fn search(
             }
 
             let batch_passage_ids =
-                unique_passage_ids.narrow(0, batch_start, batch_end - batch_start);
+                passage_ids_for_approx.narrow(0, batch_start, batch_end - batch_start);
             let (batch_packed_codes, batch_doc_lengths) =
                 doc_codes_strided.lookup(&batch_passage_ids, device);
+            if profile && batch_doc_lengths.numel() > 0 {
+                let batch_max_doc_len = batch_doc_lengths.max().int64_value(&[]);
+                approx_padded_elements += (batch_end - batch_start) as i128
+                    * batch_max_doc_len as i128
+                    * q_tokens as i128;
+            }
 
             if batch_packed_codes.numel() == 0 {
                 approx_score_chunks.push(Tensor::zeros(
@@ -590,6 +683,12 @@ pub fn search(
         } else {
             Tensor::empty(&[0], (Kind::Float, device))
         };
+        if let Some(restore_order) = approx_restore_order.as_ref() {
+            approx_scores = approx_scores.index_select(0, restore_order);
+        }
+        synchronize_if_profiling(device, profile);
+        let approx_ms = profile_stage_start.elapsed().as_secs_f64() * 1000.0;
+        profile_stage_start = Instant::now();
 
         if approx_scores.size().get(0) != Some(&unique_passage_ids.size()[0]) {
             return Err(anyhow!(
@@ -617,6 +716,9 @@ pub fn search(
                 approx_scores.topk(n_passage_ids_for_decompression, 0, true, true);
             passage_ids_to_rerank = passage_ids_to_rerank.index_select(0, &top_indices);
         }
+        synchronize_if_profiling(device, profile);
+        let prune_ms = profile_stage_start.elapsed().as_secs_f64() * 1000.0;
+        profile_stage_start = Instant::now();
 
         if passage_ids_to_rerank.numel() == 0 {
             return Ok((vec![], vec![], None));
@@ -631,12 +733,23 @@ pub fn search(
                 anyhow!("Codec missing bucket_weight_indices_lookup for decompression.")
             })?;
 
+        let (passage_ids_for_exact, exact_restore_order) = if sort_doc_batches_by_length {
+            let (sorted_passage_ids, restore_order) = sort_passage_ids_by_doc_length_with_restore(
+                &passage_ids_to_rerank,
+                doc_codes_strided,
+                device,
+            );
+            (sorted_passage_ids, Some(restore_order))
+        } else {
+            (passage_ids_to_rerank.shallow_clone(), None)
+        };
+
         // Full decompression and exact scoring. This is the highest-memory step:
         // it forms [docs_to_rerank, max_doc_tokens, query_tokens]. Long-context
         // queries can exceed VRAM even when query batch_size is 1, so allow this
         // exact scoring stage to run in implementation chunks. The candidate
         // set, n_full_scores, n_ivf_probe, and top_k semantics are unchanged.
-        let total_passage_ids_for_exact = passage_ids_to_rerank.size()[0];
+        let total_passage_ids_for_exact = passage_ids_for_exact.size()[0];
         let exact_batch_size = std::env::var("FAST_PLAID_FULL_SCORE_BATCH_SIZE")
             .ok()
             .and_then(|value| value.parse::<i64>().ok())
@@ -647,6 +760,12 @@ pub fn search(
         let num_exact_batches =
             (total_passage_ids_for_exact + exact_batch_size - 1) / exact_batch_size;
         let mut exact_score_chunks = Vec::new();
+        let mut exact_lookup_time = Duration::ZERO;
+        let mut exact_decompress_time = Duration::ZERO;
+        let mut exact_pad_time = Duration::ZERO;
+        let mut exact_matmul_time = Duration::ZERO;
+        let mut exact_reduce_time = Duration::ZERO;
+        let mut exact_padded_elements: i128 = 0;
 
         for step in 0..num_exact_batches {
             let batch_start = step * exact_batch_size;
@@ -656,11 +775,21 @@ pub fn search(
             }
 
             let batch_passage_ids =
-                passage_ids_to_rerank.narrow(0, batch_start, batch_end - batch_start);
+                passage_ids_for_exact.narrow(0, batch_start, batch_end - batch_start);
+            let exact_step_start = Instant::now();
             let (batch_codes, batch_doc_lengths) =
                 doc_codes_strided.lookup(&batch_passage_ids, device);
             let (batch_residuals, _) = doc_residuals_strided.lookup(&batch_passage_ids, device);
+            if profile {
+                synchronize_if_profiling(device, true);
+                exact_lookup_time += exact_step_start.elapsed();
+                let batch_max_doc_len = batch_doc_lengths.max().int64_value(&[]);
+                exact_padded_elements += (batch_end - batch_start) as i128
+                    * batch_max_doc_len as i128
+                    * q_tokens as i128;
+            }
 
+            let exact_step_start = Instant::now();
             let decompressed_embeddings = decompress_residuals(
                 &batch_residuals,
                 bucket_weights,
@@ -671,21 +800,47 @@ pub fn search(
                 embedding_dimension,
                 nbits_param,
             );
+            if profile {
+                synchronize_if_profiling(device, true);
+                exact_decompress_time += exact_step_start.elapsed();
+            }
 
+            let exact_step_start = Instant::now();
             let (padded_doc_embeddings, mask) =
                 direct_pad_sequences(&decompressed_embeddings, &batch_doc_lengths, 0.0, device)?;
+            if profile {
+                synchronize_if_profiling(device, true);
+                exact_pad_time += exact_step_start.elapsed();
+            }
 
+            let exact_step_start = Instant::now();
             let token_scores_3d =
                 padded_doc_embeddings.matmul(&query_embeddings_unsqueezed.transpose(-2, -1));
+            if profile {
+                synchronize_if_profiling(device, true);
+                exact_matmul_time += exact_step_start.elapsed();
+            }
+
+            let exact_step_start = Instant::now();
             let reduced_scores = colbert_score_reduce(&token_scores_3d, &mask);
+            if profile {
+                synchronize_if_profiling(device, true);
+                exact_reduce_time += exact_step_start.elapsed();
+            }
             exact_score_chunks.push(reduced_scores);
         }
 
-        let reduced_scores = if !exact_score_chunks.is_empty() {
+        let mut reduced_scores = if !exact_score_chunks.is_empty() {
             Tensor::cat(&exact_score_chunks, 0)
         } else {
             Tensor::empty(&[0], (Kind::Float, device))
         };
+        if let Some(restore_order) = exact_restore_order.as_ref() {
+            reduced_scores = reduced_scores.index_select(0, restore_order);
+        }
+        synchronize_if_profiling(device, profile);
+        let exact_ms = profile_stage_start.elapsed().as_secs_f64() * 1000.0;
+        profile_stage_start = Instant::now();
 
         // Final top-k sort
         let (reduced_scores, sorted_indices) = reduced_scores.sort(0, true);
@@ -694,10 +849,46 @@ pub fn search(
 
         let sorted_passage_ids: Vec<i64> = sorted_passage_ids.try_into()?;
         let reduced_scores: Vec<f32> = reduced_scores.try_into()?;
+        synchronize_if_profiling(device, profile);
+        let final_ms = profile_stage_start.elapsed().as_secs_f64() * 1000.0;
 
         let result_count = top_k.min(sorted_passage_ids.len());
         let result_passage_ids = sorted_passage_ids[..result_count].to_vec();
         let result_scores = reduced_scores[..result_count].to_vec();
+
+        if profile {
+            eprintln!(
+                "FAST_PLAID_PROFILE device={:?} original_q_tokens={} q_tokens={} candidates={} length_sort={} \
+rerank_docs={} approx_batches={} exact_batches={} exact_batch_size={} \
+centroid_ms={:.3} ivf_ms={:.3} approx_ms={:.3} prune_ms={:.3} \
+exact_ms={:.3} final_ms={:.3} exact_lookup_ms={:.3} \
+exact_decompress_ms={:.3} exact_pad_ms={:.3} exact_matmul_ms={:.3} \
+exact_reduce_ms={:.3} approx_padded_elements={} exact_padded_elements={} total_ms={:.3}",
+                device,
+                original_q_tokens,
+                q_tokens,
+                candidate_count,
+                sort_doc_batches_by_length,
+                total_passage_ids_for_exact,
+                num_approx_batches,
+                num_exact_batches,
+                exact_batch_size,
+                centroid_ms,
+                ivf_ms,
+                approx_ms,
+                prune_ms,
+                exact_ms,
+                final_ms,
+                exact_lookup_time.as_secs_f64() * 1000.0,
+                exact_decompress_time.as_secs_f64() * 1000.0,
+                exact_pad_time.as_secs_f64() * 1000.0,
+                exact_matmul_time.as_secs_f64() * 1000.0,
+                exact_reduce_time.as_secs_f64() * 1000.0,
+                approx_padded_elements,
+                exact_padded_elements,
+                profile_total_start.elapsed().as_secs_f64() * 1000.0,
+            );
+        }
 
         let token_matrices = if return_token_scores {
             let result_passage_ids_tensor = Tensor::from_slice(&result_passage_ids)
