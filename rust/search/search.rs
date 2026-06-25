@@ -183,18 +183,23 @@ pub struct SearchParameters {
     /// Number of IVF cells to probe during the initial search.
     #[pyo3(get, set)]
     pub n_ivf_probe: usize,
+    /// Max documents per matmul chunk during exact scoring.
+    #[pyo3(get, set)]
+    pub rerank_batch_size: usize,
 }
 
 #[pymethods]
 impl SearchParameters {
     /// Creates a new `SearchParameters` instance from Python.
     #[new]
-    fn new(batch_size: usize, n_full_scores: usize, top_k: usize, n_ivf_probe: usize) -> Self {
+    #[pyo3(signature = (batch_size, n_full_scores, top_k, n_ivf_probe, rerank_batch_size))]
+    fn new(batch_size: usize, n_full_scores: usize, top_k: usize, n_ivf_probe: usize, rerank_batch_size: usize) -> Self {
         Self {
             batch_size,
             n_full_scores,
             top_k,
             n_ivf_probe,
+            rerank_batch_size,
         }
     }
 }
@@ -264,6 +269,7 @@ pub fn search_many(
             device,
             subset_tensor.as_ref(),
             false,
+            params.rerank_batch_size as i64,
         )
         .unwrap_or_default();
 
@@ -338,6 +344,7 @@ pub fn search_many_with_token_scores(
             device,
             subset_tensor.as_ref(),
             true,
+            params.rerank_batch_size as i64,
         )
         .unwrap_or_default();
 
@@ -483,6 +490,7 @@ pub fn search(
     device: Device,
     subset: Option<&Tensor>,
     return_token_scores: bool,
+    rerank_batch_size: i64,
 ) -> anyhow::Result<(Vec<i64>, Vec<f32>, Option<Vec<Tensor>>)> {
     let (passage_ids, scores, token_matrices) = tch::no_grad(|| {
         let query_embeddings_unsqueezed = query_embeddings.unsqueeze(0);
@@ -651,9 +659,17 @@ pub fn search(
         let (padded_doc_embeddings, mask) =
             direct_pad_sequences(&decompressed_embeddings, &final_doc_lengths, 0.0, device)?;
 
-        let token_scores_3d =
-            padded_doc_embeddings.matmul(&query_embeddings_unsqueezed.transpose(-2, -1));
-        let reduced_scores = colbert_score_reduce(&token_scores_3d, &mask);
+        let num_candidates = padded_doc_embeddings.size()[0];
+        let chunk_size = rerank_batch_size.min(num_candidates);
+        let query_transposed = query_embeddings_unsqueezed.transpose(-2, -1);
+
+        let mut chunks = Vec::new();
+        for start in (0..num_candidates).step_by(chunk_size as usize) {
+            let len = chunk_size.min(num_candidates - start);
+            let scores = padded_doc_embeddings.narrow(0, start, len).matmul(&query_transposed);
+            chunks.push(colbert_score_reduce(&scores, &mask.narrow(0, start, len)));
+        }
+        let reduced_scores = Tensor::cat(&chunks, 0);
 
         // Final top-k sort
         let (reduced_scores, sorted_indices) = reduced_scores.sort(0, true);
@@ -666,15 +682,16 @@ pub fn search(
         let result_count = top_k.min(sorted_passage_ids.len());
 
         let token_matrices = if return_token_scores {
-            let sorted_token_scores = token_scores_3d.index_select(0, &sorted_indices);
-            let sorted_doc_lengths: Vec<i64> =
-                final_doc_lengths.index_select(0, &sorted_indices).try_into()?;
+            let top_indices = sorted_indices.narrow(0, 0, result_count as i64);
+            let top_embeddings = padded_doc_embeddings.index_select(0, &top_indices);
+            let top_token_scores = top_embeddings.matmul(&query_transposed);
+            let top_doc_lengths: Vec<i64> =
+                final_doc_lengths.index_select(0, &top_indices).try_into()?;
 
             let mut matrices = Vec::with_capacity(result_count);
             for i in 0..result_count {
-                let doc_len = sorted_doc_lengths[i];
-                // [max_doc_len, query_len] → [doc_len, query_len] → [query_len, doc_len]
-                let mat = sorted_token_scores
+                let doc_len = top_doc_lengths[i];
+                let mat = top_token_scores
                     .i(i as i64)
                     .narrow(0, 0, doc_len)
                     .transpose(0, 1);
