@@ -138,8 +138,9 @@ pub fn construct_index(
 ) -> PyResult<PyLoadedIndex> {
     let main_device = get_device(&device)?;
 
-    // Force document tensors to CPU in low memory mode
-    let storage_device = if low_memory { Device::Cpu } else { main_device };
+    // Residuals always on CPU; codes/lengths on GPU unless low_memory.
+    let codes_device = if low_memory { Device::Cpu } else { main_device };
+    let residuals_device = Device::Cpu;
 
     // Load codec (small tensors)
     let codec = ResidualCodec::load(
@@ -162,15 +163,16 @@ pub fn construct_index(
         _ => None,
     };
 
-    // Load document data (large tensors, may stay on CPU in low memory mode)
-    let doc_lens_t = ensure_tensor(doc_lengths, storage_device, Kind::Int64);
-    let doc_codes_t = ensure_tensor(doc_codes, storage_device, Kind::Int64);
-    let doc_residuals_t = ensure_tensor(doc_residuals, storage_device, Kind::Uint8);
+    // Load document data
+    let doc_lens_t = ensure_tensor(doc_lengths, codes_device, Kind::Int64);
+    let doc_codes_t = ensure_tensor(doc_codes, codes_device, Kind::Int64);
+    let doc_residuals_t = ensure_tensor(doc_residuals, residuals_device, Kind::Uint8);
 
     let doc_codes_strided =
-        StridedTensor::new(doc_codes_t, doc_lens_t.shallow_clone(), storage_device);
+        StridedTensor::new(doc_codes_t, doc_lens_t.shallow_clone(), codes_device);
 
-    let doc_residuals_strided = StridedTensor::new(doc_residuals_t, doc_lens_t, storage_device);
+    let doc_residuals_strided =
+        StridedTensor::new(doc_residuals_t, doc_lens_t, residuals_device);
 
     let loaded_index = LoadedIndex {
         codec,

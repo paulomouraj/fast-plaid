@@ -183,7 +183,7 @@ pub struct SearchParameters {
     /// Number of IVF cells to probe during the initial search.
     #[pyo3(get, set)]
     pub n_ivf_probe: usize,
-    /// Max documents per matmul chunk during exact scoring.
+    /// Chunk size for exact scoring. 0 (default) = no chunking.
     #[pyo3(get, set)]
     pub rerank_batch_size: usize,
 }
@@ -660,16 +660,20 @@ pub fn search(
             direct_pad_sequences(&decompressed_embeddings, &final_doc_lengths, 0.0, device)?;
 
         let num_candidates = padded_doc_embeddings.size()[0];
-        let chunk_size = rerank_batch_size.min(num_candidates);
         let query_transposed = query_embeddings_unsqueezed.transpose(-2, -1);
 
-        let mut chunks = Vec::new();
-        for start in (0..num_candidates).step_by(chunk_size as usize) {
-            let len = chunk_size.min(num_candidates - start);
-            let scores = padded_doc_embeddings.narrow(0, start, len).matmul(&query_transposed);
-            chunks.push(colbert_score_reduce(&scores, &mask.narrow(0, start, len)));
-        }
-        let reduced_scores = Tensor::cat(&chunks, 0);
+        let reduced_scores = if rerank_batch_size <= 0 || rerank_batch_size >= num_candidates {
+            let token_scores_3d = padded_doc_embeddings.matmul(&query_transposed);
+            colbert_score_reduce(&token_scores_3d, &mask)
+        } else {
+            let mut chunks = Vec::new();
+            for start in (0..num_candidates).step_by(rerank_batch_size as usize) {
+                let len = rerank_batch_size.min(num_candidates - start);
+                let scores = padded_doc_embeddings.narrow(0, start, len).matmul(&query_transposed);
+                chunks.push(colbert_score_reduce(&scores, &mask.narrow(0, start, len)));
+            }
+            Tensor::cat(&chunks, 0)
+        };
 
         // Final top-k sort
         let (reduced_scores, sorted_indices) = reduced_scores.sort(0, true);

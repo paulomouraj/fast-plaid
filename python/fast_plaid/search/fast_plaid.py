@@ -195,7 +195,7 @@ def search_on_device(
     index_object: Any,
     show_progress: bool,
     subset: list[list[int]] | None = None,
-    rerank_batch_size: int = 64,
+    rerank_batch_size: int = 0,
 ) -> list[list[tuple[int, float]]]:
     """Perform a search on a single specified device using the passed object.
 
@@ -220,7 +220,7 @@ def search_on_device(
     subset:
         Optional subset of document IDs to search within.
     rerank_batch_size:
-        Max documents per matmul chunk during exact scoring.
+        Max documents per chunk during exact scoring. 0 (default) disables chunking.
 
     """
     # Guard clause to prevent the TypeError in Rust binding
@@ -267,7 +267,7 @@ def search_on_device_with_token_scores(
     index_object: Any,
     show_progress: bool,
     subset: list[list[int]] | None = None,
-    rerank_batch_size: int = 64,
+    rerank_batch_size: int = 0,
 ) -> list[list[tuple[int, float, torch.Tensor]]]:
     """Perform a search on a single device, returning token-level similarity matrices.
 
@@ -292,7 +292,7 @@ def search_on_device_with_token_scores(
     subset:
         Optional subset of document IDs to search within.
     rerank_batch_size:
-        Max documents per matmul chunk during exact scoring.
+        Max documents per chunk during exact scoring. 0 (default) disables chunking.
 
     """
     if index_object is None:
@@ -338,6 +338,7 @@ class FastPlaid:
         index: str,
         device: str | list[str] | None = None,
         low_memory: bool = True,
+        rerank_batch_size: int = 0,
         **kwargs: Any,  # noqa: ARG002
     ) -> None:
         """Initialize the FastPlaid instance.
@@ -350,6 +351,8 @@ class FastPlaid:
             The device(s) to use for index operations (e.g., 'cuda:0', 'cpu').
         low_memory:
             Whether to use low memory mode when loading the index.
+        rerank_batch_size:
+            Max documents per chunk during exact scoring. 0 (default) disables chunking.
         kwargs:
             Additional keyword arguments.
 
@@ -372,6 +375,7 @@ class FastPlaid:
         self.torch_path = _load_torch_path(device=self.devices[0])
         self.index = index
         self.low_memory = low_memory
+        self.rerank_batch_size = rerank_batch_size
 
         # Concurrency Control
         if not os.path.exists(self.index):
@@ -1018,7 +1022,7 @@ class FastPlaid:
         n_ivf_probe: int,
         show_progress: bool,
         n_processes: int | None = None,
-        rerank_batch_size: int = 64,
+        rerank_batch_size: int = 0,
     ) -> list:
         """Dispatch search across devices, including joblib CPU parallelism.
 
@@ -1046,6 +1050,8 @@ class FastPlaid:
         n_processes:
             Number of jobs for CPU parallelism via joblib.
             Ignored on GPU. Defaults to 1.
+        rerank_batch_size:
+            Max documents per chunk during exact scoring. 0 (default) disables chunking.
 
         """
         num_queries = queries_embeddings.shape[0]
@@ -1153,7 +1159,7 @@ class FastPlaid:
         show_progress: bool = True,
         subset: list[list[int]] | list[int] | None = None,
         n_processes: int | None = None,
-        rerank_batch_size: int = 64,
+        rerank_batch_size: int | None = None,
     ) -> list[list[tuple[int, float]]]:
         """Search the index for the given query embeddings.
 
@@ -1180,9 +1186,11 @@ class FastPlaid:
             Number of jobs to use for CPU search via joblib.
             Ignored if running on GPU(s). Defaults to 1.
         rerank_batch_size:
-            Max documents per matmul chunk during exact scoring.
+            Max documents per chunk during exact scoring. 0 disables chunking. Defaults to instance setting.
 
         """
+        if rerank_batch_size is None:
+            rerank_batch_size = self.rerank_batch_size
         search_indices, queries_embeddings, subset = self._prepare_search(
             queries_embeddings, subset
         )
@@ -1212,7 +1220,7 @@ class FastPlaid:
         show_progress: bool = True,
         subset: list[list[int]] | list[int] | None = None,
         n_processes: int | None = None,
-        rerank_batch_size: int = 64,
+        rerank_batch_size: int | None = None,
     ) -> list[list[tuple[int, float, torch.Tensor]]]:
         """Search the index and return token-level similarity matrices.
 
@@ -1244,9 +1252,11 @@ class FastPlaid:
             Number of jobs to use for CPU search via joblib.
             Ignored if running on GPU(s). Defaults to 1.
         rerank_batch_size:
-            Max documents per matmul chunk during exact scoring.
+            Max documents per chunk during exact scoring. 0 disables chunking. Defaults to instance setting.
 
         """
+        if rerank_batch_size is None:
+            rerank_batch_size = self.rerank_batch_size
         search_indices, queries_embeddings, subset = self._prepare_search(
             queries_embeddings, subset
         )

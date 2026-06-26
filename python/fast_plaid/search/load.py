@@ -379,7 +379,9 @@ def _construct_index_from_tensors(
         if val is None:
             gpu_data[key] = None
         elif isinstance(val, torch.Tensor):
-            if low_memory and key in ["doc_codes", "doc_residuals", "doc_lengths"]:
+            if key == "doc_residuals" or (
+                low_memory and key in ["doc_codes", "doc_lengths"]
+            ):
                 gpu_data[key] = val
             else:
                 gpu_data[key] = val.to(device, non_blocking=True)
